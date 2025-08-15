@@ -13,6 +13,11 @@ export interface GetKeyboardResponseOptions {
   audio_context_start_time?: number;
   allow_held_key?: boolean;
   minimum_valid_rt?: number;
+  /**
+   * Whether this listener should be treated as high priority.
+   * High priority listeners are processed FIFO and exclusively when present.
+   */
+  priority?: "normal" | "high";
 }
 
 export class KeyboardListenerAPI {
@@ -30,6 +35,11 @@ export class KeyboardListenerAPI {
 
   private areRootListenersRegistered = false;
 
+  // High-priority handling
+  private highPriorityQueue: Array<(e: KeyboardEvent) => boolean> = [];
+  private highPriorityTokenToHandler = new Map<KeyboardListener, (e: KeyboardEvent) => boolean>();
+  private highPriorityHandlerToToken = new Map<(e: KeyboardEvent) => boolean, KeyboardListener>();
+
   /**
    * If not previously done and `this.getRootElement()` returns an element, adds the root key
    * listeners to that element.
@@ -46,10 +56,24 @@ export class KeyboardListenerAPI {
   }
 
   private rootKeydownListener(e: KeyboardEvent) {
-    // Iterate over a static copy of the listeners set because listeners might add other listeners
-    // that we do not want to be included in the loop
-    for (const listener of [...this.listeners]) {
-      listener(e);
+    // If there are high-priority listeners queued, handle only the head of the queue
+    if (this.highPriorityQueue.length > 0) {
+      const handler = this.highPriorityQueue[0];
+      const handled = handler(e);
+      if (handled) {
+        this.highPriorityQueue.shift();
+        const token = this.highPriorityHandlerToToken.get(handler);
+        if (token) {
+          this.highPriorityTokenToHandler.delete(token);
+          this.highPriorityHandlerToToken.delete(handler);
+        }
+      }
+    } else {
+      // Iterate over a static copy of the listeners set because listeners might add other listeners
+      // that we do not want to be included in the loop
+      for (const listener of [...this.listeners]) {
+        listener(e);
+      }
     }
     this.heldKeys.add(this.toLowerCaseIfInsensitive(e.key));
   }
@@ -87,6 +111,7 @@ export class KeyboardListenerAPI {
     audio_context_start_time,
     allow_held_key = false,
     minimum_valid_rt = this.minimumValidRt,
+    priority = "normal",
   }: GetKeyboardResponseOptions) {
     if (rt_method !== "performance" && rt_method !== "audio") {
       console.log(
@@ -104,6 +129,34 @@ export class KeyboardListenerAPI {
       valid_responses = valid_responses.map((r) => r.toLowerCase());
     }
 
+    // High-priority listener path (FIFO, exclusive, single-use)
+    if (priority === "high") {
+      const handler = (e: KeyboardEvent) => {
+        const rt = Math.round(
+          (rt_method == "performance" ? performance.now() : audio_context.currentTime * 1000) -
+            startTime
+        );
+        if (rt < minimum_valid_rt) {
+          return false;
+        }
+        const key = this.toLowerCaseIfInsensitive(e.key);
+        if (this.isResponseValid(valid_responses, allow_held_key, key)) {
+          e.preventDefault();
+          callback_function({ key: e.key, rt });
+          return true; // consumed and single-use
+        }
+        return false; // not handled; remain queued
+      };
+
+      // Create a cancellation token compatible with cancelKeyboardResponse
+      const token: KeyboardListener = () => {};
+      this.highPriorityQueue.push(handler);
+      this.highPriorityTokenToHandler.set(token, handler);
+      this.highPriorityHandlerToToken.set(handler, token);
+      return token;
+    }
+
+    // Normal listener path (existing behavior)
     const listener: KeyboardListener = (e) => {
       const rt = Math.round(
         (rt_method == "performance" ? performance.now() : audio_context.currentTime * 1000) -
@@ -135,11 +188,27 @@ export class KeyboardListenerAPI {
 
   cancelKeyboardResponse(listener: KeyboardListener) {
     // remove the listener from the set of listeners if it is contained
-    this.listeners.delete(listener);
+    if (this.listeners.delete(listener)) {
+      return;
+    }
+    // If it's a high-priority token, remove from the queue and maps
+    const handler = this.highPriorityTokenToHandler.get(listener);
+    if (handler) {
+      const index = this.highPriorityQueue.indexOf(handler);
+      if (index !== -1) {
+        this.highPriorityQueue.splice(index, 1);
+      }
+      this.highPriorityTokenToHandler.delete(listener);
+      this.highPriorityHandlerToToken.delete(handler);
+    }
   }
 
   cancelAllKeyboardResponses() {
     this.listeners.clear();
+    // Clear high-priority queue as well
+    this.highPriorityQueue = [];
+    this.highPriorityTokenToHandler.clear();
+    this.highPriorityHandlerToToken.clear();
   }
 
   compareKeys(key1: string | null, key2: string | null) {
